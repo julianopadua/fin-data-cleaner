@@ -1,0 +1,6 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+pyyaml>=6.0.1
+tqdm>=4.66.1
+pandas>=2.2.2
+streamlit>=1.35.0

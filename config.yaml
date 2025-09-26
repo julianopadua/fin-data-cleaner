@@ -1,0 +1,7 @@
+# configuration parameters
+paths:
+  data_raw: ./data/raw
+  data_processed: ./data/processed
+  images: ./images
+  report: ./report
+  addons: ./addons
