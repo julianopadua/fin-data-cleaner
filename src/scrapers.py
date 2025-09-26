@@ -97,7 +97,8 @@ def _requests_session(cfg: dict) -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries)
     sess.mount("https://", adapter)
     sess.mount("http://", adapter)
-    sess.headers.update({"User-Agent": cfg["scraper"]["user_agent"]})
+    sess.headers.update({"User-Agent": cfg["scraper"]["user_agent"], "Accept-Charset": "utf-8, iso-8859-1;q=0.8",
+    "Accept-Language": "pt-BR, pt;q=0.9, en;q=0.8"})
     return sess
 
 
@@ -126,6 +127,10 @@ def _slugify(s: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9\-_]+", "-", s)
     s = re.sub(r"-{2,}", "-", s).strip("-").lower()
     return s
+
+def _clean_unicode(s: str) -> str:
+    # troca NBSP por espaço, normaliza composição (NFC) e tira espaços laterais
+    return unicodedata.normalize("NFC", (s or "").replace("\xa0", " ")).strip()
 
 
 def _filename_from_url(url: str) -> str:
@@ -177,7 +182,7 @@ def _conab_parse_downloads(html: str) -> List[DatasetLink]:
     # Strategy: find all h4.card-title, then gather links until the next h4
     h4s = soup.find_all("h4", class_="card-title")
     for h4 in h4s:
-        category = h4.get_text(strip=True)
+        category = _clean_unicode(h4.get_text(strip=True))
         # iterate through siblings until the next h4
         sib = h4.next_sibling
         while sib:
@@ -190,8 +195,7 @@ def _conab_parse_downloads(html: str) -> List[DatasetLink]:
                 if isinstance(href, str) and href.startswith("/downloads/arquivos/"):
                     url = urljoin(_CONAB_BASE, href)
                     name_text = a.get_text(separator=" ", strip=True)
-                    # remove leading dashes like "- Armazenagem"
-                    name_text = name_text.lstrip("- ").strip()
+                    name_text = _clean_unicode(name_text.lstrip("- "))
                     filename = _filename_from_url(url)
                     ext = _ext(filename)
                     did = _slugify(f"conab__{category}__{name_text}__{filename}")
@@ -220,7 +224,12 @@ def _conab_list(cfg: dict, session: Optional[requests.Session] = None, logger: O
     logger.info("CONAB: fetching downloads page")
     r = session.get(_CONAB_PAGE, timeout=cfg["scraper"]["timeout_s"])
     r.raise_for_status()
-    items = _conab_parse_downloads(r.text)
+    try:
+        text = r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        # fallback defensivo
+        text = r.content.decode("latin-1", errors="replace")
+    items = _conab_parse_downloads(text)
     logger.info(f"CONAB: parsed {len(items)} dataset links")
     return items
 
