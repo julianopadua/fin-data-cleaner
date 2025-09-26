@@ -5,3 +5,11 @@ paths:
   images: ./images
   report: ./report
   addons: ./addons
+  logs: ./logs
+
+# network/retries for all scrapers
+scraper:
+  timeout_s: 30
+  retries: 3
+  backoff_factor: 1.0
+  user_agent: "FinDataCleaner/0.1 (+https://example.com; contact: admin@example.com)"
