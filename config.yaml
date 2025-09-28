@@ -13,3 +13,6 @@ scraper:
   retries: 3
   backoff_factor: 1.0
   user_agent: "FinDataCleaner/0.1 (+https://example.com; contact: admin@example.com)"
+
+api_keys:
+  eia: dcqfqnNdUo3BZqyLGkonSosWUGUwS2g07E0WJL1X

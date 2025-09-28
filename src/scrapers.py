@@ -160,6 +160,179 @@ def _save_stream(session: requests.Session, url: str, dest_path: str, timeout: i
     logger.info(f"Saved file: {dest_path}")
     return dest_path
 
+# ---------------------------
+# PROVIDER: EIA - Petroleum Supply Monthly (PSM)
+# ---------------------------
+
+_EIA_BASE = "https://www.eia.gov"
+_EIA_PSM_INDEX = f"{_EIA_BASE}/petroleum/supply/monthly/"
+
+def _eia_psm_parse_index(html: str) -> List[DatasetLink]:
+    """
+    Varre a tabela principal da página do PSM e coleta links para as páginas .htm
+    das séries (cada uma contém o link 'Download Series History' para .xls).
+    category = texto do <thead> mais próximo acima do link.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", class_="basic-table")
+    if not table:
+        return []
+
+    items: List[DatasetLink] = []
+    for a in table.select("a[href]"):
+        href = a.get("href", "").strip()
+        if not (href.startswith("/dnav/pet/") and href.endswith(".htm")):
+            continue
+
+        series_page_url = urljoin(_EIA_BASE, href)
+        series_id = os.path.splitext(os.path.basename(href))[0]
+        name = _clean_unicode(a.get_text(" ", strip=True))
+
+        thead = a.find_previous("thead")
+        category = _clean_unicode(thead.get_text(" ", strip=True)) if thead else ""
+
+        items.append(
+            DatasetLink(
+                id=series_id,
+                provider="eia_psm",
+                category=category,
+                name=name,
+                url=series_page_url,   # URL da página da série (não é o .xls ainda)
+                filename="",           # será definido no download; manter vazio aqui
+                ext="xls",
+            )
+        )
+
+    # de-dup por id
+    uniq = {}
+    for d in items:
+        uniq[d.id] = d
+    return list(uniq.values())
+
+
+def _eia_psm_find_xls(session: requests.Session, series_page_url: str, timeout: int) -> Optional[str]:
+    """
+    Dada a página .htm de uma série, encontra o href do 'Download Series History'
+    (ou qualquer <a> que termine com .xls). Retorna URL absoluta do .xls.
+    """
+    r = session.get(series_page_url, timeout=timeout)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # 1) Preferência por texto 'Download Series History'
+    link = soup.find("a", string=re.compile(r"Download Series History", re.I))
+    if link and link.get("href"):
+        return urljoin(series_page_url, link["href"])
+
+    # 2) Primeiro <a> com .xls
+    any_xls = soup.find("a", href=re.compile(r"\.xls$", re.I))
+    if any_xls and any_xls.get("href"):
+        return urljoin(series_page_url, any_xls["href"])
+
+    # 3) Plano C: dentro do bloco #tlinks (quando existe)
+    tlinks = soup.find(id="tlinks")
+    if tlinks:
+        xlsa = tlinks.find("a", href=re.compile(r"\.xls$", re.I))
+        if xlsa and xlsa.get("href"):
+            return urljoin(series_page_url, xlsa["href"])
+
+    return None
+
+
+def _eia_psm_list(cfg: dict,
+                  session: Optional[requests.Session] = None,
+                  logger: Optional[logging.Logger] = None) -> List[DatasetLink]:
+    session = session or _requests_session(cfg)
+    logger = logger or _setup_logger(cfg)
+    logger.info("EIA_PSM: fetching index")
+    r = session.get(_EIA_PSM_INDEX, timeout=cfg["scraper"]["timeout_s"])
+    r.raise_for_status()
+    html = r.text
+    items = _eia_psm_parse_index(html)
+    logger.info(f"EIA_PSM: parsed {len(items)} series pages")
+    # Ordena por categoria + nome para estabilidade visual
+    items.sort(key=lambda d: (d.category or "", d.name or ""))
+    return items
+
+
+def _eia_psm_download(cfg: dict, dataset_id: str, overwrite: bool = False,
+                      session: Optional[requests.Session] = None,
+                      logger: Optional[logging.Logger] = None) -> str:
+    """
+    dataset_id pode ser:
+      - id da série (ex.: 'pet_sum_snd_d_r20_mbbl_m_cur')
+      - URL para a página .htm da série
+    Salva o .xls em data/raw/<arquivo.xls>.
+    """
+    session = session or _requests_session(cfg)
+    logger = logger or _setup_logger(cfg)
+    timeout = int(cfg["scraper"]["timeout_s"])
+
+    # Resolver série -> URL da página .htm
+    if dataset_id.lower().startswith("http"):
+        series_page_url = dataset_id
+        series_id = os.path.splitext(os.path.basename(urlparse(series_page_url).path))[0]
+    else:
+        all_items = _eia_psm_list(cfg, session=session, logger=logger)
+        idx = {d.id: d for d in all_items}
+        if dataset_id not in idx:
+            # ajuda amigável
+            suggestions = [k for k in idx if dataset_id.lower() in k.lower()]
+            raise ValueError(
+                f"EIA_PSM: id não encontrado: {dataset_id}. "
+                f"Sugestões: {suggestions[:8]}"
+            )
+        series_page_url = idx[dataset_id].url
+        series_id = dataset_id
+
+    # Achar o .xls na página da série
+    xls_url = _eia_psm_find_xls(session, series_page_url, timeout)
+    if not xls_url:
+        raise RuntimeError(f"EIA_PSM: nenhum link .xls encontrado em {series_page_url}")
+
+    fname = _filename_from_url(xls_url) or f"{series_id}.xls"
+    dest_dir = cfg["paths"]["data_raw"]
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, fname)
+
+    if os.path.exists(dest_path) and not overwrite:
+        logger.info(f"EIA_PSM: arquivo já existe (skip): {dest_path}")
+        return dest_path
+
+    logger.info(f"EIA_PSM: baixando {xls_url} -> {dest_path}")
+    return _save_stream(session, xls_url, dest_path, timeout, logger)
+
+
+def _eia_psm_resolve(cfg: dict, dataset_id: str,
+                     session: Optional[requests.Session] = None,
+                     logger: Optional[logging.Logger] = None) -> str:
+    """
+    Retorna a URL direta do XLS ('Download Series History') para uma série do PSM,
+    sem salvar localmente.
+    """
+    session = session or _requests_session(cfg)
+    logger = logger or _setup_logger(cfg)
+    timeout = int(cfg["scraper"]["timeout_s"])
+
+    # Resolver série -> URL da página .htm
+    if dataset_id.lower().startswith("http"):
+        series_page_url = dataset_id
+    else:
+        all_items = _eia_psm_list(cfg, session=session, logger=logger)
+        idx = {d.id: d for d in all_items}
+        if dataset_id not in idx:
+            suggestions = [k for k in idx if dataset_id.lower() in k.lower()]
+            raise ValueError(
+                f"EIA_PSM: id não encontrado: {dataset_id}. "
+                f"Sugestões: {suggestions[:8]}"
+            )
+        series_page_url = idx[dataset_id].url
+
+    xls_url = _eia_psm_find_xls(session, series_page_url, timeout)
+    if not xls_url:
+        raise RuntimeError(f"EIA_PSM: nenhum link .xls encontrado em {series_page_url}")
+    return xls_url
+
 
 # ---------------------------
 # PROVIDER: CONAB
@@ -265,10 +438,39 @@ _PROVIDERS = {
     }
 }
 
+# ---------------------------
+# provider registry (extensible)
+# ---------------------------
+
+_PROVIDERS.update({
+    "eia_psm": {
+        "list": _eia_psm_list,
+        "download": _eia_psm_download,
+        "resolve": _eia_psm_resolve,   # <— novo
+    },
+    "eia": {  # alias
+        "list": _eia_psm_list,
+        "download": _eia_psm_download,
+        "resolve": _eia_psm_resolve,   # <— novo
+    },
+})
+
+
 
 # ---------------------------
 # public API
 # ---------------------------
+
+def resolve_dataset_url(provider: str, dataset_id: str, cfg: dict) -> str:
+    """
+    Retorna a URL direta do arquivo no provider (quando suportado).
+    Para 'eia'/'eia_psm', retorna o link do XLS 'Download Series History'.
+    """
+    provider = provider.lower().strip()
+    if provider not in _PROVIDERS or "resolve" not in _PROVIDERS[provider]:
+        raise ValueError(f"Provider '{provider}' não suporta resolução de URL direta.")
+    return _PROVIDERS[provider]["resolve"](cfg, dataset_id)
+
 
 def list_datasets(provider: str, cfg: dict) -> List[dict]:
     """
